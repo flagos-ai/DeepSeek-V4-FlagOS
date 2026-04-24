@@ -73,6 +73,7 @@ def main(
     interactive: bool = True,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
+    data_format: str = "bf16",
 ) -> None:
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -99,49 +100,60 @@ def main(
         dist.init_process_group(**init_process_group_kwargs)
         cur_rank = dist.get_rank()
 
-        pair_group_size = world_size // 8
+        use_ogroups_comm = os.getenv("USE_OGROUPS_COMM", "0").lower() in ("1", "true", "yes")
+        if use_ogroups_comm:
+            with open(config) as f_cfg:
+                cfg = json.load(f_cfg)
+            o_groups = cfg.get("o_groups", 8)
+            if world_size <= o_groups:
+                raise ValueError(
+                    f"USE_OGROUPS_COMM requires world_size ({world_size}) > o_groups ({o_groups}). "
+                    f"Please increase model parallel size or unset USE_OGROUPS_COMM."
+                )
 
-        pair_groups = []
-        for i in range(0, world_size, pair_group_size):
-            ranks = list(range(i, min(i + pair_group_size, world_size)))
-            pair_groups.append(dist.new_group(ranks=ranks))
+            pair_group_size = world_size // o_groups
 
-        pair_group_id = cur_rank // pair_group_size
-        pair_comm_group = pair_groups[pair_group_id]
-        pair_ranks = list(range(pair_group_id * pair_group_size, min((pair_group_id + 1) * pair_group_size, world_size)))
-        print(f"cur_rank: {cur_rank}, pair_comm_group ranks: {pair_ranks}", flush=True)
+            pair_groups = []
+            for i in range(0, world_size, pair_group_size):
+                ranks = list(range(i, min(i + pair_group_size, world_size)))
+                pair_groups.append(dist.new_group(ranks=ranks))
 
-        projection_group_count = world_size // 8
+            pair_group_id = cur_rank // pair_group_size
+            pair_comm_group = pair_groups[pair_group_id]
+            pair_ranks = list(range(pair_group_id * pair_group_size, min((pair_group_id + 1) * pair_group_size, world_size)))
+            print(f"cur_rank: {cur_rank}, pair_comm_group ranks: {pair_ranks}", flush=True)
 
-        proj_groups = []
-        for i in range(projection_group_count):
-            ranks = list(range(i, world_size, projection_group_count))
-            proj_groups.append(dist.new_group(ranks=ranks))
+            projection_group_count = world_size // o_groups
 
-        projection_group_id = cur_rank % projection_group_count
-        projection_comm_group = proj_groups[projection_group_id]
-        proj_ranks = list(range(projection_group_id, world_size, projection_group_count))
-        print(f"cur_rank: {cur_rank}, projection_comm_group ranks: {proj_ranks}", flush=True)
+            proj_groups = []
+            for i in range(projection_group_count):
+                ranks = list(range(i, world_size, projection_group_count))
+                proj_groups.append(dist.new_group(ranks=ranks))
 
-        dummy = torch.zeros(1, device="cuda")
+            projection_group_id = cur_rank % projection_group_count
+            projection_comm_group = proj_groups[projection_group_id]
+            proj_ranks = list(range(projection_group_id, world_size, projection_group_count))
+            print(f"cur_rank: {cur_rank}, projection_comm_group ranks: {proj_ranks}", flush=True)
 
-        dist.all_reduce(dummy, group=pair_comm_group)
-        torch.cuda.synchronize()
-        print(f"cur_rank: {cur_rank}: Initialized pair_comm_group NCCL communicator", flush=True)
+            dummy = torch.zeros(1, device="cuda")
 
-        # Then initialize projection_comm_group on ALL ranks
-        dist.all_reduce(dummy, group=projection_comm_group)
-        torch.cuda.synchronize()
-        print(f"cur_rank: {cur_rank}: Initialized projection_comm_group NCCL communicator", flush=True)
+            dist.all_reduce(dummy, group=pair_comm_group)
+            torch.cuda.synchronize()
+            print(f"cur_rank: {cur_rank}: Initialized pair_comm_group NCCL communicator", flush=True)
 
-        dist.barrier()
-        print(f"cur_rank: {cur_rank}: All communicators initialized", flush=True)
+            dist.all_reduce(dummy, group=projection_comm_group)
+            torch.cuda.synchronize()
+            print(f"cur_rank: {cur_rank}: Initialized projection_comm_group NCCL communicator", flush=True)
+
+            dist.barrier()
+            print(f"cur_rank: {cur_rank}: All communicators initialized", flush=True)
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(33377335)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
+    args.dtype = data_format
     if interactive:
         args.max_batch_size = 1
     print(args)
@@ -203,6 +215,7 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--data-format", type=str, choices=["bf16", "fp8"], default="bf16")
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.data_format)

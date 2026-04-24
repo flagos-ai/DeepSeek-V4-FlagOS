@@ -6,4 +6,5 @@ torchrun --nproc-per-node 8 \
          --max-new-tokens 28 \
          --config config_flash_v4.json \
          --input-file prompt.txt \
-         --ckpt-path path-to-bf16-mp8-ckpt
+         --ckpt-path path-to-bf16-mp8-ckpt \
+         --data-format bf16

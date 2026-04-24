@@ -12,10 +12,13 @@ import torch.distributed as dist
 
 import flag_gems
 from flag_gems import hadamard_transform
-from flag_gems.fused.mhc.hc_split_sinkhorn import (
-                    hc_split_sinkhorn,
-                    mhc_split_sinkhorn_torch_ref)
+from flag_gems.fused.mhc.hc_split_sinkhorn import hc_split_sinkhorn
 from flag_gems import sparse_attn_triton as sparse_attn
+
+try:
+    from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm
+except ImportError:
+    act_quant = fp4_act_quant = fp8_gemm = fp4_gemm = None
 
 world_size = 1
 rank = 0
@@ -27,6 +30,7 @@ scale_dtype = torch.float32
 
 g_pair_comm_group = None
 g_projection_comm_group = None
+g_data_format = "bf16"
 
 
 @contextmanager
@@ -178,10 +182,7 @@ class ColumnParallelLinear(Linear):
 
 class RowParallelLinear(Linear):
     """Shards input dim across TP ranks. All-reduce on output to sum partial results."""
-    #def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None, comm_group=None):
-        # Set comm_group before calling super().__init__() since parent might set attributes
         self.comm_group = comm_group
         if comm_group is None:
             assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
@@ -388,9 +389,11 @@ class Compressor(nn.Module):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         if self.rotate:
             kv = rotate_activation(kv)
-            # fp4_act_quant(kv, fp4_block_size, True)
-        # else:
-        #     act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+            if g_data_format != "bf16":
+                fp4_act_quant(kv, fp4_block_size, True)
+        else:
+            if g_data_format != "bf16":
+                act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         if start_pos == 0:
             self.kv_cache[:bsz, :seqlen // ratio] = kv
         else:
@@ -411,7 +414,7 @@ class Indexer(torch.nn.Module):
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.bfloat16)
+        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
         self.weights_proj = ColumnParallelLinear(self.dim, self.n_heads, dtype=torch.bfloat16)
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
@@ -433,8 +436,8 @@ class Indexer(torch.nn.Module):
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
-        # use fp4 simulation for q and kv in indexer
-        # fp4_act_quant(q, fp4_block_size, True)
+        if g_data_format != "bf16":
+            fp4_act_quant(q, fp4_block_size, True)
         self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
@@ -479,10 +482,10 @@ class Attention(nn.Module):
         self.eps = args.norm_eps
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
-        self.wq_a = Linear(self.dim, self.q_lora_rank, dtype=torch.bfloat16)
+        self.wq_a = Linear(self.dim, self.q_lora_rank, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.bfloat16)
-        self.wkv = Linear(self.dim, self.head_dim, dtype=torch.bfloat16)
+        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
+        self.wkv = Linear(self.dim, self.head_dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
 
         if g_projection_comm_group is None:
@@ -493,7 +496,7 @@ class Attention(nn.Module):
             self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim, comm_group=g_projection_comm_group)
 
         self.softmax_scale = self.head_dim ** -0.5
-        self.changed = True
+        self.changed = g_pair_comm_group is not None
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
@@ -534,8 +537,9 @@ class Attention(nn.Module):
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        if g_data_format != "bf16":
         # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
-        # act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
@@ -664,24 +668,28 @@ class MoE(nn.Module):
         elif args.expert_dtype == "fp8":
             expert_dtype = torch.float8_e4m3fn
         else:
-            None
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
+            expert_dtype = None
+        if g_data_format == "bf16":
+            expert_dtype = torch.bfloat16
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         # no swiglu_limit
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16)
+        self.shared_experts = Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
-        torch.cuda.synchronize()
-        indices_cpu = indices.flatten().cpu()
-        counts_cpu = torch.bincount(indices_cpu, minlength=self.n_routed_experts)
-        counts = counts_cpu.cuda() 
-        #counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        torch.cuda.synchronize()
+        if g_data_format == "bf16":
+            torch.cuda.synchronize()
+            indices_cpu = indices.flatten().cpu()
+            counts_cpu = torch.bincount(indices_cpu, minlength=self.n_routed_experts)
+            counts = counts_cpu.cuda()
+            torch.cuda.synchronize()
+        else:
+            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
                 continue
@@ -789,8 +797,8 @@ class MTPBlock(Block):
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__(layer_id, args)
-        self.e_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16)
-        self.h_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16)
+        self.e_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
+        self.h_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16 if g_data_format == "bf16" else None)
         self.enorm = RMSNorm(args.dim, args.norm_eps)
         self.hnorm = RMSNorm(args.dim, args.norm_eps)
         self.norm = RMSNorm(args.dim, args.norm_eps)
@@ -820,11 +828,12 @@ class Transformer(nn.Module):
     """Full DeepSeek-V4 model: embed -> HC-expand -> N blocks -> HC-head -> logits.
     Sets global state (world_size, rank, default_dtype, scale_fmt, scale_dtype) in __init__."""
     def __init__(self, args: ModelArgs, pair_comm_group=None, projection_comm_group=None):
-        global world_size, rank, g_pair_comm_group, g_projection_comm_group
+        global world_size, rank, g_pair_comm_group, g_projection_comm_group, default_dtype, scale_fmt, scale_dtype, g_data_format
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         g_pair_comm_group = pair_comm_group
         g_projection_comm_group = projection_comm_group
+        g_data_format = args.dtype
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
         scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32

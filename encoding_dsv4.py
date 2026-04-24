@@ -1,3 +1,4 @@
+# Copy from https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash/tree/master/inference/generate.py
 """
 DeepSeek-V4 Encoding
 

@@ -80,7 +80,7 @@ mapping = {
 }
 
 
-def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
+def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype, o_groups=8, data_format="bf16"):
     """
     Converts and saves model checkpoint files into a specified format.
 
@@ -89,11 +89,22 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
         save_path (str): Path to the directory where the converted checkpoint files will be saved.
         n_experts (int): Total number of experts in the model.
         mp (int): Model parallelism factor.
-        
+        o_groups (int): Number of output projection groups.
+        data_format (str): Data format for inference, "bf16" or "fp8".
+
     Returns:
         None
     """
     torch.set_num_threads(8)
+
+    use_ogroups_comm = os.getenv("USE_OGROUPS_COMM", "0").lower() in ("1", "true", "yes")
+    if use_ogroups_comm:
+        if mp <= o_groups:
+            raise ValueError(
+                f"USE_OGROUPS_COMM requires model-parallel ({mp}) > o_groups ({o_groups}). "
+                f"Please increase --model-parallel or unset USE_OGROUPS_COMM."
+            )
+
     n_local_experts = n_experts // mp
     state_dicts = [{} for _ in range(mp)]
 
@@ -125,36 +136,44 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
                         if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
                             continue
                     elif dim is not None:
-                        changed=True
-                        if not changed:
+                        if use_ogroups_comm and ("wo_a" in name or "wo_b" in name):
+                            num_projection_groups = mp // o_groups
+                            new_mp = mp // num_projection_groups
+                            new_i = i // num_projection_groups
+                            shard_size = param.size(dim) // new_mp
+                            new_param = param.narrow(dim, new_i * shard_size, shard_size).contiguous()
+                        else:
                             assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
                             shard_size = param.size(dim) // mp
                             new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                        else:
-                            print(f"Processing parameter {name} with shape {param.shape} for model parallel shard {i}")
-                            if "wo_a" not in name and "wo_b" not in name:
-                                assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
-                                shard_size = param.size(dim) // mp
-                                new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                            else:
-                                num_projection_groups = mp//8
-                                new_mp = mp // num_projection_groups
-                                new_i = i // num_projection_groups
-                                shard_size = param.size(dim) // new_mp
-                                assert(shard_size==1024)
-                                new_param = param.narrow(dim, new_i * shard_size, shard_size).contiguous()
                     state_dicts[i][name] = new_param
 
     os.makedirs(save_path, exist_ok=True)
 
     for i in trange(mp):
         names = list(state_dicts[i].keys())
+        if data_format != "bf16":
+            for name in names:
+                if name.endswith("wo_a.weight"):
+                    weight = state_dicts[i][name]
+                    scale = state_dicts[i].pop(name.replace("weight", "scale"))
+                    weight = weight.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128)).float() * scale[:, None, :, None].float()
+                    state_dicts[i][name] = weight.flatten(2, 3).flatten(0, 1).bfloat16()
+                elif "experts" in name and state_dicts[i][name].dtype == torch.int8:
+                    if expert_dtype == "fp8":
+                        scale_name = name.replace("weight", "scale")
+                        weight = state_dicts[i].pop(name)
+                        scale = state_dicts[i].pop(scale_name)
+                        state_dicts[i][name], state_dicts[i][scale_name] = cast_e2m1fn_to_e4m3fn(weight, scale)
+                    else:
+                        state_dicts[i][name] = state_dicts[i][name].view(torch.float4_e2m1fn_x2)
         save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
 
     for file in ["tokenizer.json", "tokenizer_config.json"]:
         old_file_path = os.path.join(hf_ckpt_path, file)
         new_file_path = os.path.join(save_path, file)
-        shutil.copyfile(old_file_path, new_file_path)
+        if os.path.exists(old_file_path):
+            shutil.copyfile(old_file_path, new_file_path)
 
 
 if __name__ == "__main__":
@@ -164,6 +183,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-experts", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
     parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4"], required=False, default=None)
+    parser.add_argument("--o-groups", type=int, default=8)
+    parser.add_argument("--data-format", type=str, choices=["bf16", "fp8", "fp4"], default="bf16")
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
-    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype)
+    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype, args.o_groups, args.data_format)
