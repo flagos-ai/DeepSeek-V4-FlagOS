@@ -108,6 +108,8 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
                 name = name.replace("self_attn", "attn")
                 name = name.replace("mlp", "ffn")
                 name = name.replace("weight_scale_inv", "scale")
+                if expert_dtype == "int8":
+                    name = name.replace(".weight.scale", ".scale")  # int8 quantized scale
                 name = name.replace("e_score_correction_bias", "bias")
                 if any(x in name for x in ["hc", "attn_sink", "tie2eid", "ape"]):    # without .weight
                     key = name.split(".")[-1]
@@ -154,7 +156,8 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
     for file in ["tokenizer.json", "tokenizer_config.json"]:
         old_file_path = os.path.join(hf_ckpt_path, file)
         new_file_path = os.path.join(save_path, file)
-        shutil.copyfile(old_file_path, new_file_path)
+        if os.path.exists(old_file_path):
+            shutil.copyfile(old_file_path, new_file_path)
 
 
 if __name__ == "__main__":
@@ -163,7 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--n-experts", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
-    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4"], required=False, default=None)
+    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4", "int8"], required=False, default=None)
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype)

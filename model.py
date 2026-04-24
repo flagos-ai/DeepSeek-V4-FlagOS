@@ -46,7 +46,7 @@ class ModelArgs:
     max_seq_len: int = 4096
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
-    expert_dtype: Literal[None, "fp4", "fp8"] = None
+    expert_dtype: Literal[None, "fp4", "fp8", "int8"] = None
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
     vocab_size: int = 129280
     dim: int = 4096
@@ -86,6 +86,8 @@ class ModelArgs:
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # quant
+    quantization_config: Optional[dict] = None
 
 
 class ParallelEmbedding(nn.Module):
@@ -113,6 +115,86 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
+def int8_linear_w8a8_native(
+    x: torch.Tensor,            # (M, K)  bf16/fp16 激活
+    weight_int8: torch.Tensor,  # (N, K)  int8 量化权重
+    weight_scale: torch.Tensor, # (N,)    bf16/fp16 per-channel 缩放因子
+) -> torch.Tensor:
+    """
+    W8A8 量化线性层 —— 使用 torch._int_mm 走 INT8 Tensor Core（H20 兼容）
+    """
+    orig_dtype = x.dtype
+    orig_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    M, K = x.shape
+
+    # --- Step 1: 激活 per-token 对称 INT8 量化 ---
+    x_float = x.float()
+    x_abs_max = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    x_scale = x_abs_max / 127.0
+    x_int8 = (x_float / x_scale).round().clamp(-128, 127).to(torch.int8)
+
+    # --- Step 2: K 维度 padding 到 16 的倍数 ---
+    pad_k = (16 - K % 16) % 16
+    if pad_k:
+        x_int8 = F.pad(x_int8, (0, pad_k))
+        weight_int8 = F.pad(weight_int8, (0, pad_k))
+
+    # --- Step 3: M 维度 padding（torch._int_mm 要求 M > 16）---
+    pad_m = max(17 - M, 0)
+    if pad_m:
+        x_int8 = F.pad(x_int8, (0, 0, 0, pad_m))         # (M+pad_m, K')
+        x_scale = F.pad(x_scale, (0, 0, 0, pad_m))        # (M+pad_m, 1)
+
+    # --- Step 4: INT8 矩阵乘法 (走 INT8 Tensor Core) ---
+    out_int32 = torch._int_mm(x_int8, weight_int8.t())
+
+    # --- Step 5: 截掉 M 维度的 padding ---
+    if pad_m:
+        out_int32 = out_int32[:M]
+        x_scale = x_scale[:M]
+
+    # --- Step 6: 反量化 rescale ---
+    out = (out_int32.to(orig_dtype)
+           * x_scale.to(orig_dtype)
+           * weight_scale.unsqueeze(0).to(orig_dtype))
+
+    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+
+
+def int8_linear_scaled_mm(
+    x: torch.Tensor,                # (M, K)  bf16/fp16 激活
+    weight_int8: torch.Tensor,      # (N, K)  int8 量化权重
+    weight_scale: torch.Tensor,     # (N,)    bf16/fp16 per-channel 缩放因子
+) -> torch.Tensor:
+    """
+    W8A8 量化线性层 —— PyTorch 原生实现（H20 兼容）
+
+    激活侧做 per-token 对称 INT8 量化，权重保持 INT8，
+    计算通过反量化 + F.linear 完成，利用 BF16/FP16 Tensor Core。
+    """
+
+    # --- Step 1: 激活 per-token 对称 INT8 量化 ---
+    x_float = x.float()                             # 先转 FP32 避免溢出
+    x_abs_max = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    x_scale = x_abs_max / 127.0                     # (M, 1) float32
+
+    # 量化到 int8，并使用 torch.where 完成 round 与 clamp 的一次性操作
+    x_int8_float = (x_float / x_scale).round()
+    x_int8 = torch.where(
+        x_int8_float > 127, 127.0,
+        torch.where(x_int8_float < -128, -128.0, x_int8_float)
+    ).to(torch.int8)
+
+    # --- Step 2: 权重反量化 (一次性，可缓存) ---
+    weight_dequant = (weight_int8.to(x.dtype) * weight_scale.unsqueeze(-1))
+
+    # --- Step 3: 调用标准 F.linear (走 BF16/FP16 Tensor Core) ---
+    out = F.linear(x, weight_dequant)
+
+    return out
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Dispatches to fp4_gemm / fp8_gemm / F.linear based on weight dtype.
     For quantized weights, x is first quantized to FP8 via act_quant."""
@@ -124,19 +206,25 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     elif weight.dtype == torch.float8_e4m3fn:
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp8_gemm(x, s, weight, weight.scale, scale_dtype)
+    elif weight.dtype == torch.int8:
+        return int8_linear_scaled_mm(x, weight, weight.scale)
     else:
         return F.linear(x, weight)
 
 
 class Linear(nn.Module):
-    """Linear layer supporting BF16, FP8, and FP4 weight formats with per-block scaling."""
+    """Linear layer supporting BF16, FP8, FP4, and INT8 weight formats with per-block scaling."""
+    quantization_config: Optional[str] = None
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None, is_quant: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         dtype = dtype or default_dtype
-        if dtype == torch.float4_e2m1fn_x2:
+        if is_quant:
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.int8), requires_grad=False)
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16))
+        elif dtype == torch.float4_e2m1fn_x2:
             # FP4: weight is [out, in//2] in float4_e2m1fn_x2, logically [out, in] in fp4
             # Scale is [out, in//32] in float8_e8m0fnu (1 scale per 32 fp4 elements along K)
             self.weight = nn.Parameter(torch.empty(out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2))
@@ -625,11 +713,11 @@ class Gate(nn.Module):
 
 class Expert(nn.Module):
     """Single MoE expert: SwiGLU FFN (w1, w2, w3). Computation in float32 for stability."""
-    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0):
+    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0, is_quant: bool = False):
         super().__init__()
-        self.w1 = Linear(dim, inter_dim, dtype=dtype)
-        self.w2 = Linear(inter_dim, dim, dtype=dtype)
-        self.w3 = Linear(dim, inter_dim, dtype=dtype)
+        self.w1 = Linear(dim, inter_dim, dtype=dtype, is_quant=is_quant)
+        self.w2 = Linear(inter_dim, dim, dtype=dtype, is_quant=is_quant)
+        self.w3 = Linear(dim, inter_dim, dtype=dtype, is_quant=is_quant)
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -648,7 +736,7 @@ class Expert(nn.Module):
 class MoE(nn.Module):
     """Mixture-of-Experts: gate routes each token to top-k routed experts + 1 shared expert.
     Experts are sharded across TP ranks; each rank handles n_routed_experts // world_size experts."""
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, quantize=True, dtype=None):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
@@ -659,17 +747,23 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
-        if args.expert_dtype == "fp4":
+        self.quantize = quantize
+        quant = (self.quantize and Linear.quantization_config is not None
+                and Linear.quantization_config.get("quant_method") == "linear_int8"
+                and Linear.quantization_config.get("target") == "moe_experts")
+        if not quant and args.expert_dtype == "fp4":
             expert_dtype = torch.float4_e2m1fn_x2
-        elif args.expert_dtype == "fp8":
+        elif not quant and args.expert_dtype == "fp8":
             expert_dtype = torch.float8_e4m3fn
+        elif not quant and args.expert_dtype == "int8":
+            expert_dtype = torch.int8
         else:
-            None
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
+            expert_dtype = torch.bfloat16
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit, dtype=dtype, is_quant=quant) if self.experts_start_idx <= i < self.experts_end_idx else None
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         # no swiglu_limit
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16)
+        self.shared_experts = Expert(args.dim, args.moe_inter_dim, dtype=torch.bfloat16, is_quant=False)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -789,6 +883,7 @@ class MTPBlock(Block):
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__(layer_id, args)
+        self.ffn = MoE(layer_id, args, quantize=False, dtype=torch.bfloat16)
         self.e_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16)
         self.h_proj = Linear(args.dim, args.dim, dtype=torch.bfloat16)
         self.enorm = RMSNorm(args.dim, args.norm_eps)
@@ -820,6 +915,8 @@ class Transformer(nn.Module):
     """Full DeepSeek-V4 model: embed -> HC-expand -> N blocks -> HC-head -> logits.
     Sets global state (world_size, rank, default_dtype, scale_fmt, scale_dtype) in __init__."""
     def __init__(self, args: ModelArgs, pair_comm_group=None, projection_comm_group=None):
+        if args.quantization_config:
+            Linear.quantization_config = args.quantization_config
         global world_size, rank, g_pair_comm_group, g_projection_comm_group
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
