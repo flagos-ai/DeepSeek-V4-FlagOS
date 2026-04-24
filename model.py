@@ -1,4 +1,5 @@
 # Modified from https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash/tree/master/inference/model.py
+import os
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
@@ -15,7 +16,15 @@ from flag_gems import hadamard_transform
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
                     hc_split_sinkhorn,
                     mhc_split_sinkhorn_torch_ref)
-from flag_gems import sparse_attn_triton as sparse_attn
+if os.environ.get('VENDOR_PATCH') == 'ascend':
+    from attntorch import sparse_attn_pytorch as sparse_attn
+else:
+    from flag_gems import sparse_attn_triton as sparse_attn
+
+_is_ascend = os.environ.get('VENDOR_PATCH') == 'ascend'
+
+_fp4_dtype = None if _is_ascend else getattr(torch, 'float4_e2m1fn_x2', None)
+_scale_e8m0_dtype = None if _is_ascend else getattr(torch, 'float8_e8m0fnu', None)
 
 world_size = 1
 rank = 0
@@ -118,7 +127,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     For quantized weights, x is first quantized to FP8 via act_quant."""
     assert bias is None
 
-    if weight.dtype == torch.float4_e2m1fn_x2:
+    if _fp4_dtype is not None and weight.dtype == _fp4_dtype:
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
     elif weight.dtype == torch.float8_e4m3fn:
@@ -136,18 +145,18 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         dtype = dtype or default_dtype
-        if dtype == torch.float4_e2m1fn_x2:
+        if _fp4_dtype is not None and dtype == _fp4_dtype:
             # FP4: weight is [out, in//2] in float4_e2m1fn_x2, logically [out, in] in fp4
             # Scale is [out, in//32] in float8_e8m0fnu (1 scale per 32 fp4 elements along K)
-            self.weight = nn.Parameter(torch.empty(out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2))
+            self.weight = nn.Parameter(torch.empty(out_features, in_features // 2, dtype=_fp4_dtype))
             scale_out_features = out_features
             scale_in_features = in_features // fp4_block_size
-            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float8_e8m0fnu))
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=_scale_e8m0_dtype))
         elif dtype == torch.float8_e4m3fn:
             self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
-            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float8_e8m0fnu))
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=_scale_e8m0_dtype))
         else:
             self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
             self.register_parameter("scale", None)
@@ -660,7 +669,7 @@ class MoE(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
         if args.expert_dtype == "fp4":
-            expert_dtype = torch.float4_e2m1fn_x2
+            expert_dtype = _fp4_dtype
         elif args.expert_dtype == "fp8":
             expert_dtype = torch.float8_e4m3fn
         else:
@@ -827,7 +836,7 @@ class Transformer(nn.Module):
         g_projection_comm_group = projection_comm_group
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
-        scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
+        scale_dtype = _scale_e8m0_dtype if (not _is_ascend and args.scale_dtype == "fp8") else torch.float32
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.norm_eps = args.norm_eps

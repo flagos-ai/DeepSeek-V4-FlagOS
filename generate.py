@@ -4,6 +4,10 @@ import json
 from argparse import ArgumentParser
 from typing import List
 
+if os.environ.get('VENDOR_PATCH') == 'ascend':
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
@@ -78,14 +82,18 @@ def main(
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-    if os.getenv("USE_FLAGGEMS", "false").lower() in ("1", "true", "yes"):
+    if os.environ.get('VENDOR_PATCH') == 'ascend':
+        import flag_gems
+        flag_gems.only_enable(record=True, once=True, path="/root/gems.txt", include=["ne_scalar", "lt_scalar", "ge_scalar"])
+    elif os.getenv("USE_FLAGGEMS", "false").lower() in ("1", "true", "yes"):
         import flag_gems
         flag_gems.enable(record=True, once=True, path="/tmp/gems.txt")
     global print
     if rank != 0:
         print = lambda *_, **__: None
     torch.cuda.set_device(local_rank)
-    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    if os.environ.get('VENDOR_PATCH') != 'ascend':
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
     pair_comm_group = None
     projection_comm_group = None

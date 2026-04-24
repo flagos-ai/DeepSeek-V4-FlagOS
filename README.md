@@ -114,3 +114,20 @@ bash run_node_1.sh
 torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR \
     generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
+
+---
+
+## 多芯片支持
+
+本项目通过环境变量 `VENDOR_PATCH` 支持不同硬件平台。启动推理时设置对应的值即可，代码会自动切换到该平台的适配路径。
+
+### 华为 Ascend A3
+
+需要安装 `torch_npu` 及 Ascend 驱动。启动时设置 `VENDOR_PATCH=ascend`：
+
+```bash
+VENDOR_PATCH=ascend torchrun --nproc-per-node ${MP} generate.py \
+    --ckpt-path ${SAVE_PATH} --config config_flash_v4.json --input-file ${FILE} --max-new-tokens 30
+```
+
+权重需提前转换为 BF16 MP16 格式（参见上方参数转换章节）。
