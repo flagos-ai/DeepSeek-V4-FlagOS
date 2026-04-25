@@ -12,9 +12,7 @@ import torch.distributed as dist
 
 import flag_gems
 from flag_gems import hadamard_transform
-from flag_gems.fused.mhc.hc_split_sinkhorn import (
-                    hc_split_sinkhorn,
-                    mhc_split_sinkhorn_torch_ref)
+from flag_gems.fused.mhc.hc_split_sinkhorn import hc_split_sinkhorn
 from flag_gems import sparse_attn_triton as sparse_attn
 
 world_size = 1
@@ -266,10 +264,7 @@ class ColumnParallelLinear(Linear):
 
 class RowParallelLinear(Linear):
     """Shards input dim across TP ranks. All-reduce on output to sum partial results."""
-    #def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
-
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None, comm_group=None):
-        # Set comm_group before calling super().__init__() since parent might set attributes
         self.comm_group = comm_group
         if comm_group is None:
             assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
@@ -581,7 +576,7 @@ class Attention(nn.Module):
             self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim, comm_group=g_projection_comm_group)
 
         self.softmax_scale = self.head_dim ** -0.5
-        self.changed = True
+        self.changed = g_pair_comm_group is not None
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)

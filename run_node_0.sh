@@ -3,6 +3,7 @@ export NCCL_SOCKET_IFNAME=eth0
 export NCCL_IB_DISABLE=1
 
 export USE_FLAGGEMS=1
+export USE_OGROUPS_COMM=1
 
 
 torchrun \

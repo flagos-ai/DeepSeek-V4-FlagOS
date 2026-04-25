@@ -1,28 +1,28 @@
-# 基于FlagOS的DeepSeek推理代码
+# DeepSeek Inference Code Based on FlagOS
 
-## 新增功能
+## Features
 
-### FlagGems 加速支持
-通过设置环境变量 `USE_FLAGGEMS=1` 启用 [FlagGems](https://github.com/FlagOpen/FlagGems) 算子加速。
+### FlagGems Acceleration
+Enable [FlagGems](https://github.com/FlagOpen/FlagGems) operator acceleration by setting the environment variable `USE_FLAGGEMS=1`.
 
-### FP8/FP4 → BF16 权重转换工具
-支持将 DeepSeek-V3.2 的量化权重（MXFP4 E2M1 / FP8 E4M3）直接反量化为 BF16 格式，无需依赖 `kernel.py`，纯 PyTorch 实现。
+### O-Groups Grouped Projection Communication
+When the model parallel size (MP) is greater than `o_groups`, set the environment variable `USE_OGROUPS_COMM=1` to enable grouped projection communication optimization for `wo_a` / `wo_b` (pair_comm_group and projection_comm_group). If MP <= o_groups, enabling this option will raise an error.
 
-### 模型并行分片优化
-`convert.py` 针对 `wo_a` / `wo_b` 权重新增分组投影分片逻辑，支持更大规模的模型并行。
+### FP8/FP4 → BF16 Weight Conversion Tool
+Supports dequantizing DeepSeek-V3.2 quantized weights (MXFP4 E2M1 / FP8 E4M3) directly to BF16 format, implemented in pure PyTorch without depending on `kernel.py`.
 
 ---
 
-## 安装依赖
+## Installation
 
 ```bash
-# 安装原始依赖 
+# Install base dependencies
 pip install -r requirements.txt
 
-# 安装 FlagGems
+# Install FlagGems
 pip install flag-gems==5.0.2
 
-# 安装FlagTree, 以英伟达平台为例, 其他芯片请参考https://github.com/flagos-ai/flagtree：
+# Install FlagTree (NVIDIA platform example; for other chips see https://github.com/flagos-ai/flagtree):
 python3 -m pip uninstall -y triton
 python3 -m pip install flagtree===0.5.0 --index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple
 
@@ -30,19 +30,26 @@ python3 -m pip install flagtree===0.5.0 --index-url=https://resource.flagos.net/
 
 ---
 
-## 参数转换
+## Weight Conversion
 
-### 方式一：从 HuggingFace 格式转换（原始流程）
+### Option 1: Convert from HuggingFace Format (Standard Flow)
 
 ```bash
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
 ```
 
-如需使用 FP8 专家权重，去掉 `config_flash_v4.json` 中的 `"expert_dtype": "fp4"` 并在 `convert.py` 中指定 `--expert-dtype fp8`。
+When MP > o_groups and grouped projection communication is needed:
 
-### 方式二：FP8/FP4 量化权重转 BF16（新增）
+```bash
+export USE_OGROUPS_COMM=1
+python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
+```
 
-按参考convert_weight.sh脚本流程执行：
+To use FP8 expert weights, remove `"expert_dtype": "fp4"` from `config_flash_v4.json` and specify `--expert-dtype fp8` in `convert.py`.
+
+### Option 2: FP8/FP4 Quantized Weights → BF16
+
+Follow the convert_weight.sh script:
 
 ```bash
 # Step1: fp4/fp8 -> bf16
@@ -56,32 +63,33 @@ export HF_CKPT_PATH=path-to-bf16-ckpt
 export SAVE_PATH=path-to-bf16-mp16-ckpt
 
 export EXPERTS=256
-python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+export USE_OGROUPS_COMM=1
+python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
 ```
 
 ---
 
-## 推理
+## Inference
 
-### 交互式对话
+### Interactive Chat
 
 ```bash
 torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --interactive --temperature ${T}
 ```
 
-### 文件批量推理
+### Batch Inference from File
 
 ```bash
 torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
 
-### 单节点 8-GPU（MP8，启用 FlagGems）
+### Single Node 8-GPU (MP8, with FlagGems)
 
 ```bash
 bash run_mp8.sh
 ```
 
-等价命令：
+Equivalent command:
 
 ```bash
 export USE_FLAGGEMS=1
@@ -92,25 +100,28 @@ torchrun --nproc-per-node 8 generate.py \
     --ckpt-path path-to-bf16-mp8-ckpt
 ```
 
-### 双节点 16-GPU（MP16，启用 FlagGems）
+Note: MP=8 equals the default o_groups=8, which does not meet the USE_OGROUPS_COMM requirement, so it should not be set.
 
-在 node 0 上运行：
+### Two-Node 16-GPU (MP16, with FlagGems + O-Groups Communication)
+
+On node 0:
 
 ```bash
 bash run_node_0.sh
 ```
 
-在 node 1 上运行：
+On node 1:
 
 ```bash
 bash run_node_1.sh
 ```
 
-运行前需在脚本中将 `--master_addr` 和 `--master_port` 替换为实际地址。
+Replace `--master_addr` and `--master_port` in the scripts with actual values before running. MP=16 > o_groups=8, so `USE_OGROUPS_COMM=1` is already set in the scripts.
 
-### 通用多节点推理
+### General Multi-Node Inference
 
 ```bash
+# When MP > o_groups, add: export USE_OGROUPS_COMM=1
 torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR \
     generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
