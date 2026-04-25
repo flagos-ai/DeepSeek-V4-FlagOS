@@ -11,6 +11,9 @@ When the model parallel size (MP) is greater than `o_groups`, set the environmen
 ### FP8/FP4 → BF16 Weight Conversion Tool
 Supports dequantizing DeepSeek-V3.2 quantized weights (MXFP4 E2M1 / FP8 E4M3) directly to BF16 format, implemented in pure PyTorch without depending on `kernel.py`.
 
+### INT8 MoE Expert Quantization
+Quantize MoE expert weights from BF16 to INT8 (per-channel symmetric) using `quantize_int8_moe.py`, then run inference with `config_pro_v4_int8.json`.
+
 ---
 
 ## Installation
@@ -54,7 +57,7 @@ Follow the convert_weight.sh script:
 ```bash
 # Step1: fp4/fp8 -> bf16
 python3 convert_weight.py \
-    --input-fp8-hf-path path-to-fp4-or-fp8-ckpt \
+    --input-fp4-hf-path path-to-fp4-or-fp8-ckpt \
     --output-bf16-hf-path path-to-bf16-ckpt
 
 # Step2: bf16 -> bf16-mp16
@@ -66,6 +69,30 @@ export EXPERTS=256
 export USE_OGROUPS_COMM=1
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
 ```
+
+### Option 3: INT8 MoE Expert Quantization (BF16 → INT8)
+
+Quantize MoE expert weights to INT8, then shard for model-parallel inference.
+
+```bash
+# Step 1: Quantize expert weights BF16 -> INT8
+python3 quantize_int8_moe.py \
+    --input_dir path-to-bf16-hf-ckpt \
+    --output_dir path-to-int8-hf-ckpt \
+    --config_path config_pro_v4_int8.json
+
+# Step 2: Shard for model-parallel
+export MP=16
+python convert.py \
+    --hf-ckpt-path path-to-int8-hf-ckpt \
+    --save-path path-to-int8-mp16-ckpt \
+    --n-experts 384 \
+    --model-parallel ${MP} \
+    --expert-dtype int8 \
+    --o-groups 16
+```
+
+Use `config_pro_v4_int8.json` for inference, which includes `quantization_config` to enable INT8 dequantization at runtime.
 
 ---
 
@@ -125,3 +152,26 @@ Replace `--master_addr` and `--master_port` in the scripts with actual values be
 torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR \
     generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
+
+### INT8 Quantized Model Inference
+
+```bash
+# Use config_pro_v4_int8.json which contains quantization_config
+torchrun --nproc-per-node ${MP} generate.py \
+    --ckpt-path path-to-int8-mp16-ckpt \
+    --config config_pro_v4_int8.json \
+    --input-file prompt.txt
+```
+
+---
+
+## Config Reference
+
+| Config | Model | expert_dtype | quantization_config | Description |
+|--------|-------|-------------|---------------------|-------------|
+| `config_flash_v4.json` | V4-Flash | fp4 | — | Flash model, 256 experts, o_groups=8 |
+| `config_pro_v4.json` | V4-Pro | fp4 | — | Pro model, 384 experts, o_groups=16 |
+| `config_pro_v4_int8.json` | V4-Pro | fp4 | linear_int8 | Pro model with INT8 quantized MoE experts |
+
+- `expert_dtype`: controls how expert weights are stored on disk (fp4/fp8/int8)
+- `quantization_config`: when present, enables INT8 dequantization for MoE experts at runtime

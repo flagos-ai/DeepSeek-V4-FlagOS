@@ -11,6 +11,9 @@
 ### FP8/FP4 → BF16 权重转换工具
 支持将 DeepSeek-V3.2 的量化权重（MXFP4 E2M1 / FP8 E4M3）直接反量化为 BF16 格式，无需依赖 `kernel.py`，纯 PyTorch 实现。
 
+### INT8 MoE 专家量化
+支持将 BF16 模型的 MoE 专家权重量化为 INT8（逐通道对称量化），使用 `quantize_int8_moe.py` 量化后配合 `config_pro_v4_int8.json` 进行推理。
+
 ---
 
 ## 安装依赖
@@ -47,17 +50,17 @@ python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-ex
 
 如需使用 FP8 专家权重，去掉 `config_flash_v4.json` 中的 `"expert_dtype": "fp4"` 并在 `convert.py` 中指定 `--expert-dtype fp8`。
 
-### 方式二：FP8/FP4 量化权重转 BF16（新增）
+### 方式二：FP8/FP4 量化权重转 BF16
 
-按参考convert_weight.sh脚本流程执行：
+参考 convert_weight.sh 脚本流程执行：
 
 ```bash
-# Step1: fp4/fp8 -> bf16
+# 第一步：fp4/fp8 -> bf16
 python3 convert_weight.py \
-    --input-fp8-hf-path path-to-fp4-or-fp8-ckpt \
+    --input-fp4-hf-path path-to-fp4-or-fp8-ckpt \
     --output-bf16-hf-path path-to-bf16-ckpt
 
-# Step2: bf16 -> bf16-mp16
+# 第二步：bf16 -> bf16-mp16
 export MP=16
 export HF_CKPT_PATH=path-to-bf16-ckpt
 export SAVE_PATH=path-to-bf16-mp16-ckpt
@@ -66,6 +69,30 @@ export EXPERTS=256
 export USE_OGROUPS_COMM=1
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
 ```
+
+### 方式三：INT8 MoE 专家量化（BF16 → INT8）
+
+将 BF16 模型的 MoE 专家权重量化为 INT8，再分片用于模型并行推理。
+
+```bash
+# 第一步：将专家权重从 BF16 量化为 INT8
+python3 quantize_int8_moe.py \
+    --input_dir path-to-bf16-hf-ckpt \
+    --output_dir path-to-int8-hf-ckpt \
+    --config_path config_pro_v4_int8.json
+
+# 第二步：分片用于模型并行
+export MP=16
+python convert.py \
+    --hf-ckpt-path path-to-int8-hf-ckpt \
+    --save-path path-to-int8-mp16-ckpt \
+    --n-experts 384 \
+    --model-parallel ${MP} \
+    --expert-dtype int8 \
+    --o-groups 16
+```
+
+推理时使用 `config_pro_v4_int8.json`，其中包含 `quantization_config` 字段以在运行时启用 INT8 反量化。
 
 ---
 
@@ -125,3 +152,26 @@ bash run_node_1.sh
 torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR \
     generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
+
+### INT8 量化模型推理
+
+```bash
+# 使用包含 quantization_config 的 config_pro_v4_int8.json
+torchrun --nproc-per-node ${MP} generate.py \
+    --ckpt-path path-to-int8-mp16-ckpt \
+    --config config_pro_v4_int8.json \
+    --input-file prompt.txt
+```
+
+---
+
+## 配置文件说明
+
+| 配置文件 | 模型 | expert_dtype | quantization_config | 说明 |
+|---------|------|-------------|---------------------|------|
+| `config_flash_v4.json` | V4-Flash | fp4 | — | Flash 模型，256 专家，o_groups=8 |
+| `config_pro_v4.json` | V4-Pro | fp4 | — | Pro 模型，384 专家，o_groups=16 |
+| `config_pro_v4_int8.json` | V4-Pro | fp4 | linear_int8 | Pro 模型，MoE 专家权重 INT8 量化 |
+
+- `expert_dtype`：控制专家权重在磁盘上的存储格式（fp4/fp8/int8）
+- `quantization_config`：存在时，在运行时启用 MoE 专家的 INT8 反量化

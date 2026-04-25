@@ -1,6 +1,6 @@
 # Step1: fp4/fp8 -> bf16
 python3 convert_weight.py \
-	--input-fp8-hf-path path-to-fp4-or-fp8-ckpt \
+	--input-fp4-hf-path path-to-fp4-or-fp8-ckpt \
     --output-bf16-hf-path path-to-bf16-ckpt
 
 # Step2: bf16 -> bf16-mp16
