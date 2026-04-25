@@ -1,7 +1,7 @@
 # Based on https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py
 """
-DeepSeek-V4 FP8/FP4 -> BF16 Converter
-This script converts DeepSeek-V4 FP8/FP4 quantized checkpoints to BF16 format by dequantizing weights using the corresponding scales. It handles both non-expert (FP8 E4M3) and expert (MXFP4 E2M1) weights, as well as the special case of DSA indexer weights and MTP layers.
+DeepSeek-V4 FP4/FP8 -> BF16 Converter
+This script converts DeepSeek-V4 FP4/FP8 quantized checkpoints to BF16 format by dequantizing weights using the corresponding scales. It handles both non-expert (FP8 E4M3) and expert (MXFP4 E2M1) weights, as well as the special case of DSA indexer weights and MTP layers.
 """
 
 import os
@@ -26,7 +26,7 @@ _FP4_E2M1_LUT = torch.tensor([
 ], dtype=torch.bfloat16)
 
 
-def dequant_fp4_weight(weight_packed: torch.Tensor, scale_fp8: torch.Tensor) -> torch.Tensor:
+def dequant_fp4_weight(weight_packed: torch.Tensor, scale_e8m0: torch.Tensor) -> torch.Tensor:
     """
     Dequantize MXFP4 weight to bf16 by unpacking FP4 E2M1 nibbles via LUT.
 
@@ -36,7 +36,7 @@ def dequant_fp4_weight(weight_packed: torch.Tensor, scale_fp8: torch.Tensor) -> 
 
     Args:
         weight_packed: [out_features, in_features/2], int8, each byte = 2 FP4 values
-        scale_fp8:     [out_features, in_features/32], float8_e8m0fnu, E8M0 scale per group of 32
+        scale_e8m0:    [out_features, in_features/32], float8_e8m0fnu, E8M0 scale per group of 32
     Returns:
         bf16 tensor [out_features, in_features]
     """
@@ -54,7 +54,7 @@ def dequant_fp4_weight(weight_packed: torch.Tensor, scale_fp8: torch.Tensor) -> 
     fp4_values = torch.stack([low_vals, high_vals], dim=-1).reshape(out_features, in_features)
 
     # Decode E8M0 scale and expand to match fp4_values
-    scale = decode_e8m0_scale(scale_fp8)
+    scale = decode_e8m0_scale(scale_e8m0)
     if scale.dim() == 2 and scale.shape[0] == out_features:
         # Scale already shaped [out_features, num_groups_per_row]
         num_groups_per_row = scale.shape[1]
@@ -141,7 +141,7 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
     return weight
 
 
-def main(fp8_path, bf16_path, device="cuda"):
+def main(input_path, bf16_path, device="cuda"):
     torch.set_default_dtype(torch.bfloat16)
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -152,7 +152,7 @@ def main(fp8_path, bf16_path, device="cuda"):
 
     # 1. Copy non-safetensor files (config.json, tokenizer, etc.)
     print("Copying auxiliary files...")
-    for file_path in glob(os.path.join(fp8_path, "*")):
+    for file_path in glob(os.path.join(input_path, "*")):
         fname = os.path.basename(file_path)
         if fname.endswith(".safetensors") or fname == "model.safetensors.index.json":
             continue
@@ -162,7 +162,7 @@ def main(fp8_path, bf16_path, device="cuda"):
             print(f"  Copied {fname}")
 
     # 2. Load model index
-    model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
+    model_index_file = os.path.join(input_path, "model.safetensors.index.json")
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     weight_map = model_index["weight_map"]
@@ -201,16 +201,16 @@ def main(fp8_path, bf16_path, device="cuda"):
         if file_name is None:
             raise KeyError(tensor_name)
         if file_name not in loaded_files:
-            file_path = os.path.join(fp8_path, file_name)
+            file_path = os.path.join(input_path, file_name)
             loaded_files[file_name] = load_file(file_path, device="cpu")
         return loaded_files[file_name][tensor_name]
 
     # 4. Process safetensor files one by one
-    safetensor_files = sorted(glob(os.path.join(fp8_path, "*.safetensors")))
+    safetensor_files = sorted(glob(os.path.join(input_path, "*.safetensors")))
     converted_count = 0
     kept_count = 0
 
-    for safetensor_file in tqdm(safetensor_files, desc="Converting FP8 -> BF16"):
+    for safetensor_file in tqdm(safetensor_files, desc="Converting FP4/FP8 -> BF16"):
         file_name = os.path.basename(safetensor_file)
         current_state_dict = load_file(safetensor_file, device="cpu")
         loaded_files[file_name] = current_state_dict
@@ -269,7 +269,7 @@ def main(fp8_path, bf16_path, device="cuda"):
         json.dump(new_index, f, indent=2)
 
     print(f"\nDone!")
-    print(f"  FP8/FP4 -> BF16 converted: {converted_count}")
+    print(f"  FP4/FP8 -> BF16 converted: {converted_count}")
     print(f"  Already BF16/FP32 (kept as-is): {kept_count}")
     print(f"  Scale entries removed: {len(all_scale_names)}")
     print(f"  Output keys: {len(new_weight_map)} (was {len(weight_map)})")
@@ -277,12 +277,12 @@ def main(fp8_path, bf16_path, device="cuda"):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Convert DeepSeek-V4 FP8/FP4 checkpoint to BF16")
-    parser.add_argument("--input-fp8-hf-path", type=str, required=True,
-                        help="Path to the FP8 HuggingFace model directory (DeepSeek-V4)")
+    parser = ArgumentParser(description="Convert DeepSeek-V4 FP4/FP8 checkpoint to BF16")
+    parser.add_argument("--input-fp4-hf-path", type=str, required=True,
+                        help="Path to the FP4/FP8 HuggingFace model directory (DeepSeek-V4)")
     parser.add_argument("--output-bf16-hf-path", type=str, required=True,
                         help="Path to the output BF16 model directory")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
                         help="Device for dequantization (default: cuda)")
     args = parser.parse_args()
-    main(args.input_fp8_hf_path, args.output_bf16_hf_path, args.device)
+    main(args.input_fp4_hf_path, args.output_bf16_hf_path, args.device)

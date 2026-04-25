@@ -116,45 +116,45 @@ class ParallelEmbedding(nn.Module):
 
 
 def int8_linear_w8a8_native(
-    x: torch.Tensor,            # (M, K)  bf16/fp16 激活
-    weight_int8: torch.Tensor,  # (N, K)  int8 量化权重
-    weight_scale: torch.Tensor, # (N,)    bf16/fp16 per-channel 缩放因子
+    x: torch.Tensor,            # (M, K)  bf16/fp16 activations
+    weight_int8: torch.Tensor,  # (N, K)  int8 quantized weights
+    weight_scale: torch.Tensor, # (N,)    bf16/fp16 per-channel scale factors
 ) -> torch.Tensor:
     """
-    W8A8 量化线性层 —— 使用 torch._int_mm 走 INT8 Tensor Core（H20 兼容）
+    W8A8 quantized linear layer — uses torch._int_mm for INT8 Tensor Core (H20 compatible)
     """
     orig_dtype = x.dtype
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
     M, K = x.shape
 
-    # --- Step 1: 激活 per-token 对称 INT8 量化 ---
+    # --- Step 1: Activation per-token symmetric INT8 quantization ---
     x_float = x.float()
     x_abs_max = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
     x_scale = x_abs_max / 127.0
     x_int8 = (x_float / x_scale).round().clamp(-128, 127).to(torch.int8)
 
-    # --- Step 2: K 维度 padding 到 16 的倍数 ---
+    # --- Step 2: Pad K dimension to a multiple of 16 ---
     pad_k = (16 - K % 16) % 16
     if pad_k:
         x_int8 = F.pad(x_int8, (0, pad_k))
         weight_int8 = F.pad(weight_int8, (0, pad_k))
 
-    # --- Step 3: M 维度 padding（torch._int_mm 要求 M > 16）---
+    # --- Step 3: Pad M dimension (torch._int_mm requires M > 16) ---
     pad_m = max(17 - M, 0)
     if pad_m:
         x_int8 = F.pad(x_int8, (0, 0, 0, pad_m))         # (M+pad_m, K')
         x_scale = F.pad(x_scale, (0, 0, 0, pad_m))        # (M+pad_m, 1)
 
-    # --- Step 4: INT8 矩阵乘法 (走 INT8 Tensor Core) ---
+    # --- Step 4: INT8 matrix multiplication (via INT8 Tensor Core) ---
     out_int32 = torch._int_mm(x_int8, weight_int8.t())
 
-    # --- Step 5: 截掉 M 维度的 padding ---
+    # --- Step 5: Trim M dimension padding ---
     if pad_m:
         out_int32 = out_int32[:M]
         x_scale = x_scale[:M]
 
-    # --- Step 6: 反量化 rescale ---
+    # --- Step 6: Dequantize rescale ---
     out = (out_int32.to(orig_dtype)
            * x_scale.to(orig_dtype)
            * weight_scale.unsqueeze(0).to(orig_dtype))
@@ -163,33 +163,33 @@ def int8_linear_w8a8_native(
 
 
 def int8_linear_scaled_mm(
-    x: torch.Tensor,                # (M, K)  bf16/fp16 激活
-    weight_int8: torch.Tensor,      # (N, K)  int8 量化权重
-    weight_scale: torch.Tensor,     # (N,)    bf16/fp16 per-channel 缩放因子
+    x: torch.Tensor,                # (M, K)  bf16/fp16 activations
+    weight_int8: torch.Tensor,      # (N, K)  int8 quantized weights
+    weight_scale: torch.Tensor,     # (N,)    bf16/fp16 per-channel scale factors
 ) -> torch.Tensor:
     """
-    W8A8 量化线性层 —— PyTorch 原生实现（H20 兼容）
+    W8A8 quantized linear layer — native PyTorch implementation (H20 compatible)
 
-    激活侧做 per-token 对称 INT8 量化，权重保持 INT8，
-    计算通过反量化 + F.linear 完成，利用 BF16/FP16 Tensor Core。
+    Activation side uses per-token symmetric INT8 quantization, weights stay INT8,
+    computation via dequantization + F.linear, utilizing BF16/FP16 Tensor Core.
     """
 
-    # --- Step 1: 激活 per-token 对称 INT8 量化 ---
-    x_float = x.float()                             # 先转 FP32 避免溢出
+    # --- Step 1: Activation per-token symmetric INT8 quantization ---
+    x_float = x.float()                             # Convert to FP32 to avoid overflow
     x_abs_max = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
     x_scale = x_abs_max / 127.0                     # (M, 1) float32
 
-    # 量化到 int8，并使用 torch.where 完成 round 与 clamp 的一次性操作
+    # Quantize to int8, using torch.where for combined round and clamp
     x_int8_float = (x_float / x_scale).round()
     x_int8 = torch.where(
         x_int8_float > 127, 127.0,
         torch.where(x_int8_float < -128, -128.0, x_int8_float)
     ).to(torch.int8)
 
-    # --- Step 2: 权重反量化 (一次性，可缓存) ---
+    # --- Step 2: Weight dequantization (one-time, cacheable) ---
     weight_dequant = (weight_int8.to(x.dtype) * weight_scale.unsqueeze(-1))
 
-    # --- Step 3: 调用标准 F.linear (走 BF16/FP16 Tensor Core) ---
+    # --- Step 3: Standard F.linear call (via BF16/FP16 Tensor Core) ---
     out = F.linear(x, weight_dequant)
 
     return out
