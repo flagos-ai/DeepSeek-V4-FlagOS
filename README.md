@@ -14,6 +14,12 @@ Supports dequantizing DeepSeek-V3.2 quantized weights (MXFP4 E2M1 / FP8 E4M3) di
 ### INT8 MoE Expert Quantization
 Quantize MoE expert weights from BF16 to INT8 (per-channel symmetric) using `quantize_int8_moe.py`, then run inference with `config_pro_v4_int8.json`.
 
+### Streaming Weight Conversion (Memory-Optimized)
+`convert_streaming.py` is optimized for converting ultra-large models (e.g., 2T parameters) under limited memory. It provides the same functionality as `convert.py`, with additional support for:
+- Multi-process parallel conversion (`--num-workers`)
+- Optional `--streaming` mode that uses temporary files + incremental saving to avoid loading full shards into memory
+- `--o-groups` grouped projection sharding and `--expert-dtype int8`
+
 ---
 
 ## Installation
@@ -48,6 +54,22 @@ export USE_OGROUPS_COMM=1
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
 ```
 
+If memory is insufficient (e.g., converting ultra-large models), use the streaming version:
+
+```bash
+# Multi-process parallel conversion
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4
+
+# Low-memory streaming mode (reduces memory usage via temporary files)
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4 --streaming
+
+# With o-groups grouped projection sharding (when MP > o_groups)
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8 --num-workers 4
+```
+
 To use FP8 expert weights, remove `"expert_dtype": "fp4"` from `config_flash_v4.json` and specify `--expert-dtype fp8` in `convert.py`.
 
 ### Option 2: FP8/FP4 Quantized Weights → BF16
@@ -55,12 +77,12 @@ To use FP8 expert weights, remove `"expert_dtype": "fp4"` from `config_flash_v4.
 Follow the convert_weight.sh script:
 
 ```bash
-# Step1: fp4/fp8 -> bf16
+# Step 1: fp4/fp8 -> bf16
 python3 convert_weight.py \
     --input-fp4-hf-path path-to-fp4-or-fp8-ckpt \
     --output-bf16-hf-path path-to-bf16-ckpt
 
-# Step2: bf16 -> bf16-mp16
+# Step 2: bf16 -> bf16-mp16
 export MP=16
 export HF_CKPT_PATH=path-to-bf16-ckpt
 export SAVE_PATH=path-to-bf16-mp16-ckpt
