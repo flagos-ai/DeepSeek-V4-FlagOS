@@ -3,7 +3,8 @@ import os
 import shutil
 from argparse import ArgumentParser
 from glob import glob
-from tqdm import tqdm, trange
+from multiprocessing import Pool
+from tqdm import tqdm
 
 import torch
 from safetensors.torch import safe_open, save_file
@@ -80,34 +81,12 @@ mapping = {
 }
 
 
-def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype, o_groups=8):
-    """
-    Converts and saves model checkpoint files into a specified format.
-
-    Args:
-        hf_ckpt_path (str): Path to the directory containing the input checkpoint files.
-        save_path (str): Path to the directory where the converted checkpoint files will be saved.
-        n_experts (int): Total number of experts in the model.
-        mp (int): Model parallelism factor.
-        o_groups (int): Number of output projection groups.
-
-    Returns:
-        None
-    """
-    torch.set_num_threads(8)
-
-    use_ogroups_comm = os.getenv("USE_OGROUPS_COMM", "0").lower() in ("1", "true", "yes")
-    if use_ogroups_comm:
-        if mp <= o_groups:
-            raise ValueError(
-                f"USE_OGROUPS_COMM requires model-parallel ({mp}) > o_groups ({o_groups}). "
-                f"Please increase --model-parallel or unset USE_OGROUPS_COMM."
-            )
-
+def process_shard(rank, mp, hf_ckpt_path, save_path, n_experts, expert_dtype, file_paths, threads_per_proc, o_groups, use_ogroups_comm):
+    torch.set_num_threads(threads_per_proc)
     n_local_experts = n_experts // mp
-    state_dicts = [{} for _ in range(mp)]
+    state_dict = {}
 
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+    for file_path in file_paths:
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 param: torch.Tensor = f.get_tensor(name)
@@ -121,7 +100,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype, o_groups=8):
                 if expert_dtype == "int8":
                     name = name.replace(".weight.scale", ".scale")  # int8 quantized scale
                 name = name.replace("e_score_correction_bias", "bias")
-                if any(x in name for x in ["hc", "attn_sink", "tie2eid", "ape"]):    # without .weight
+                if any(x in name for x in ["hc", "attn_sink", "tie2eid", "ape"]):
                     key = name.split(".")[-1]
                 else:
                     key = name.split(".")[-2]
@@ -130,30 +109,73 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype, o_groups=8):
                 else:
                     new_key, dim = key, None
                 name = name.replace(key, new_key)
-                for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                            continue
-                    elif dim is not None:
-                        if use_ogroups_comm and ("wo_a" in name or "wo_b" in name):
-                            num_projection_groups = mp // o_groups
-                            new_mp = mp // num_projection_groups
-                            new_i = i // num_projection_groups
-                            shard_size = param.size(dim) // new_mp
-                            new_param = param.narrow(dim, new_i * shard_size, shard_size).contiguous()
-                        else:
-                            assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
-                            shard_size = param.size(dim) // mp
-                            new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
 
+                new_param = param
+                if "experts" in name and "shared_experts" not in name:
+                    idx = int(name.split(".")[-3])
+                    if idx < rank * n_local_experts or idx >= (rank + 1) * n_local_experts:
+                        continue
+                elif dim is not None:
+                    if use_ogroups_comm and ("wo_a" in name or "wo_b" in name):
+                        num_projection_groups = mp // o_groups
+                        new_mp = mp // num_projection_groups
+                        new_i = rank // num_projection_groups
+                        shard_size = param.size(dim) // new_mp
+                        new_param = param.narrow(dim, new_i * shard_size, shard_size).contiguous()
+                    else:
+                        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
+                        shard_size = param.size(dim) // mp
+                        new_param = param.narrow(dim, rank * shard_size, shard_size).contiguous()
+                state_dict[name] = new_param
+
+    save_file(state_dict, os.path.join(save_path, f"model{rank}-mp{mp}.safetensors"))
+    print(f"Shard {rank}/{mp} done.", flush=True)
+
+
+def _process_shard_wrapper(args):
+    return process_shard(*args)
+
+
+def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype, o_groups=8, num_workers=None):
+    """
+    Converts and saves model checkpoint files into a specified format.
+
+    Args:
+        hf_ckpt_path (str): Path to the directory containing the input checkpoint files.
+        save_path (str): Path to the directory where the converted checkpoint files will be saved.
+        n_experts (int): Total number of experts in the model.
+        mp (int): Model parallelism factor.
+        o_groups (int): Number of output projection groups.
+        num_workers (int): Max parallel processes. Each worker holds its own shard in memory,
+                           so peak memory ~ num_workers x shard_size. Defaults to mp.
+
+    Returns:
+        None
+    """
+    use_ogroups_comm = os.getenv("USE_OGROUPS_COMM", "0").lower() in ("1", "true", "yes")
+    if use_ogroups_comm:
+        if mp <= o_groups:
+            raise ValueError(
+                f"USE_OGROUPS_COMM requires model-parallel ({mp}) > o_groups ({o_groups}). "
+                f"Please increase --model-parallel or unset USE_OGROUPS_COMM."
+            )
+
+    if num_workers is None:
+        num_workers = mp
+
+    file_paths = sorted(glob(os.path.join(hf_ckpt_path, "*.safetensors")))
     os.makedirs(save_path, exist_ok=True)
 
-    for i in trange(mp):
-        names = list(state_dicts[i].keys())
-        save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
+    total_threads = os.cpu_count() or 8
+    threads_per_proc = max(1, total_threads // num_workers)
+
+    args_list = [
+        (i, mp, hf_ckpt_path, save_path, n_experts, expert_dtype, file_paths, threads_per_proc, o_groups, use_ogroups_comm)
+        for i in range(mp)
+    ]
+    with Pool(processes=num_workers) as pool:
+        for _ in tqdm(pool.imap_unordered(_process_shard_wrapper, args_list), total=mp, desc="Converting shards"):
+            pass
 
     for file in ["tokenizer.json", "tokenizer_config.json"]:
         old_file_path = os.path.join(hf_ckpt_path, file)
@@ -170,6 +192,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-parallel", type=int, required=True)
     parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4", "int8"], required=False, default=None)
     parser.add_argument("--o-groups", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Max parallel processes (default: same as --model-parallel). "
+                             "Each worker holds its own shard in memory, so peak memory ~ num_workers x shard_size. "
+                             "Reduce if OOM.")
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
-    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype, args.o_groups)
+    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype, args.o_groups, args.num_workers)
